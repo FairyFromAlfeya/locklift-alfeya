@@ -16,7 +16,21 @@ import {
 import path, { parse, resolve } from "path";
 import { promisify } from "util";
 import { logger } from "../../logger";
-import { catchError, concat, defer, filter, from, lastValueFrom, map, mergeMap, tap, throwError, toArray } from "rxjs";
+import {
+  catchError,
+  concat,
+  defer,
+  filter,
+  from,
+  lastValueFrom,
+  map,
+  mergeMap,
+  tap,
+  throwError,
+  toArray,
+  iif,
+  of,
+} from "rxjs";
 import semver from "semver/preload";
 
 export function checkDirEmpty(dir: fs.PathLike): fs.PathLike | boolean {
@@ -52,6 +66,22 @@ export const compilerConfigResolver = async ({
   } as BuilderConfig;
   if ("path" in compiler) {
     builderConfig.compilerPath = compiler.path;
+
+    const versionFromLocalCompiler = await promisify(exec)(`${compiler.path} --version`).then(r =>
+      r.stdout.trim().match(/(?<=Version: |sold)(.*)(?=\+commit)/),
+    );
+
+    if (!versionFromLocalCompiler) {
+      throw new Error("Cannot get compiler version");
+    }
+
+    if (semver.lte(versionFromLocalCompiler[0], "0.71.0")) {
+      builderConfig.mode = "solc";
+    }
+
+    if (semver.gte(versionFromLocalCompiler[0], "0.72.0")) {
+      builderConfig.mode = "sold";
+    }
   }
   if ("version" in compiler) {
     if (semver.lte(compiler.version, "0.71.0")) {
@@ -72,6 +102,14 @@ export const compilerConfigResolver = async ({
   if (linker && "path" in linker) {
     builderConfig.linkerPath = linker.path;
     builderConfig.linkerLibPath = linker.lib;
+
+    const isEverAsm = await promisify(exec)(`${linker.path} --version`)
+      .then(r => r.stdout.trim().match(/ever_assembler/))
+      .then(r => r && r.length);
+
+    if (isEverAsm) {
+      builderConfig.linkerMode = "ever-assembler";
+    }
   }
   if (linker && "version" in linker) {
     if (!("version" in compiler)) {
@@ -191,7 +229,7 @@ export const compileBySolC = async ({
 
           if (semver.gte(compilerVersion, "0.68.0")) {
             const additionalIncludesPath = `${nodeModules ? `--include-path ${nodeModules}` : ""}`;
-            const includePath = `${additionalIncludesPath} ${"--base-path"} . `;
+            const includePath = `${additionalIncludesPath} --base-path . `;
             const execCommand = ` ${compilerPath} ${
               !disableIncludePath ? includePath : ""
             } -o ${buildFolder}  ${path} ${(compilerParams || []).join(" ")}`;
@@ -206,7 +244,7 @@ export const compileBySolC = async ({
           })),
           catchError(e => {
             logger.printError(`path: ${path}, contractFile: ${contractFileName} error: ${e?.stderr?.toString() || e}`);
-            return throwError(undefined);
+            return throwError(() => undefined);
           }),
         );
       }),
@@ -239,7 +277,7 @@ export const compileBySolC = async ({
           }),
           catchError(e => {
             logger.printError(`contractFileName: ${contractFileName} error:${e?.stderr?.toString()}`);
-            return throwError(undefined);
+            return throwError(() => undefined);
           }),
           map(matchResult => {
             if (!matchResult) {
@@ -258,7 +296,7 @@ export const compileBySolC = async ({
             ).pipe(
               catchError(e => {
                 logger.printError(e?.stderr?.toString());
-                return throwError(undefined);
+                return throwError(() => undefined);
               }),
             );
           }),
@@ -276,6 +314,8 @@ export const compileBySolD = async ({
   disableIncludePath,
   compilerPath,
   compilerParams,
+  linkerPath,
+  linkerLibPath,
 }: {
   contracts: Array<{ path: string; contractFileName: string }>;
   compilerVersion: string;
@@ -284,6 +324,8 @@ export const compileBySolD = async ({
   compilerPath: string;
   compilerParams?: string[];
   soldPath: string;
+  linkerPath?: string;
+  linkerLibPath?: string;
 }) => {
   await lastValueFrom(
     from(contracts).pipe(
@@ -292,7 +334,7 @@ export const compileBySolD = async ({
         return defer(async () => {
           if (semver.gte(compilerVersion, "0.72.0")) {
             const additionalIncludesPath = `${nodeModules ? `--include-path ${nodeModules}` : ""}`;
-            const includePath = `${additionalIncludesPath} ${"--base-path"} . `;
+            const includePath = `${additionalIncludesPath} --base-path . `;
             const execCommand = ` ${compilerPath} ${
               !disableIncludePath ? includePath : ""
             } -o ${buildFolder}  ${path} ${(compilerParams || []).join(" ")}`;
@@ -308,7 +350,7 @@ export const compileBySolD = async ({
           })),
           catchError(e => {
             logger.printError(`path: ${path}, contractFile: ${contractFileName} error: ${e?.stderr?.toString() || e}`);
-            return throwError(undefined);
+            return throwError(() => undefined);
           }),
         );
       }),
@@ -318,6 +360,49 @@ export const compileBySolD = async ({
           isValidCompilerOutputLog(output.output.stderr.toString()) &&
           logger.printBuilderLog(output.output.stderr.toString()),
       ),
+
+      filter(({ output }) => {
+        //Only contracts
+        return !!output?.stdout.toString();
+      }),
+      mergeMap(({ contractFileName }) => {
+        const resolvedPathCode = resolve(buildFolder, `${contractFileName}.code`);
+        const resolvedPathMap = resolve(buildFolder, `${contractFileName}.map.json`);
+        const resolvedPathTvc = resolve(buildFolder, `${contractFileName}.tvc`);
+
+        return iif(
+          () => !!linkerPath && !!linkerLibPath,
+          defer(async () => {
+            const command = `${linkerPath} -b ${resolve(
+              buildFolder,
+              `${contractFileName}.tvc`,
+            )} -d ${resolvedPathMap} "${linkerLibPath}" "${resolvedPathCode}"`;
+
+            return promisify(exec)(command).then(() => resolvedPathTvc);
+          }).pipe(
+            catchError(e => {
+              logger.printError(`contractFileName: ${contractFileName} error:${e?.stderr?.toString()}`);
+              return throwError(() => undefined);
+            }),
+            mergeMap(tvcFile => {
+              return concat(
+                defer(() =>
+                  promisify(fs.writeFile)(
+                    resolve(buildFolder, `${contractFileName}.base64`),
+                    tvcToBase64(fs.readFileSync(tvcFile)),
+                  ),
+                ),
+              ).pipe(
+                catchError(e => {
+                  logger.printError(e?.stderr?.toString());
+                  return throwError(() => undefined);
+                }),
+              );
+            }),
+          ),
+          of(contractFileName),
+        );
+      }),
       toArray(),
     ),
   );

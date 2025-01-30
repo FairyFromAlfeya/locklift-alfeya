@@ -24,6 +24,7 @@ export type BuilderConfig = {
   externalContracts: LockliftConfig["compiler"]["externalContracts"];
   externalContractsArtifacts: LockliftConfig["compiler"]["externalContractsArtifacts"];
   mode: "solc" | "sold";
+  linkerMode: "tvm-linker" | "ever-assembler";
 };
 type Option = {
   build: string;
@@ -131,6 +132,8 @@ export class Builder {
         disableIncludePath: this.options.disableIncludePath,
         buildFolder: this.options.build,
         soldPath: this.config.soldPath,
+        linkerPath: this.config.linkerMode === "ever-assembler" ? this.config.linkerPath : undefined,
+        linkerLibPath: this.config.linkerMode === "ever-assembler" ? this.config.linkerLibPath : undefined,
       });
     }
   }
